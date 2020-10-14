@@ -31,7 +31,11 @@ def test_command_line_interface():
     runner = CliRunner()
     result = runner.invoke(cli.main)
     assert result.exit_code == 0
-    assert 'check_terms.cli.main' in result.output
+    assert "Verbose: False" in result.output
+    assert "no_term_allowed: False" in result.output
+    assert "ignore_allowed_db: False" in result.output
     help_result = runner.invoke(cli.main, ['--help'])
+    print("Help Result:", help_result.output)
     assert help_result.exit_code == 0
-    assert '--help  Show this message and exit.' in help_result.output
+    assert '--help' in help_result.output
+    assert 'Show this message and exit.' in help_result.output
