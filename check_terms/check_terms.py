@@ -1,118 +1,29 @@
 #!/usr/bin/env python3
 
-
-from collections import defaultdict
+import functools
 import subprocess
 import os
-import re
-import time
+import logging
 import multiprocessing
 
-DEFAULT_TERMS = """
-master
-slave
-white?list
-black?list
-grandfather
-dummy
-stupid
-"""
-#sub :! subnet, substr, sub?set, subclass, subtest, submit, subscribe, subject, sub?process, mitsubishi, subcategory, subtotal, subpremise, submarket, subplot
+import time
+from collections import defaultdict
 
-message_lock = multiprocessing.Lock()
+from multiprocessing_logging import install_mp_handler
 
-VERBOSE = False
+from .block_db import load_blocked_db, should_block
+from .utils import ProgressTracker
+
+
 IGNORE_TERM_ALLOWED = False
 IGNORE_ALLOWED_DB = False
-
-def message(*msg):
-    global message_lock
-    if VERBOSE:
-        with message_lock:
-            print(os.getpid(), *msg, file=sys.stderr, end='\n', flush=True)
-
-class BlockedDB:
-    def __init__(self, file_path):
-        self.file_path = file_path
-        self.terms_pattern = None
-        self.terms = set()
-        self.exclusion_patterns = []
-
-        if not os.path.exists(file_path):
-            message("Creating blocked db config file {}, using defaults".format(file_path))
-            with open(file_path, 'w') as f:
-                for term in DEFAULT_TERMS.strip().split('\n'):
-                    print(term.strip(), file=f, end='\n')
-        else:
-            message("Reading existing blocked db config file {}".format(file_path))
-
-        non_exclusion_terms = set()
-
-        for term, exclusions in self._read_blocked_db(file_path):
-            self.terms.add(term)
-            if exclusions:
-                check_pat = re.compile("(?=({}.*))".format(term), re.IGNORECASE)
-                exclusions_re = ".*|".join(sorted(exclusions))
-                exclusions_pat = re.compile("(?=({}.*))".format(exclusions_re), re.IGNORECASE)
-                self.exclusion_patterns.append((check_pat, exclusions_pat))
-            else:
-                non_exclusion_terms.add(term)
-
-        self.terms_pattern = "|".join(sorted(self.terms))
-        if non_exclusion_terms:
-            self.non_excluded_pat = re.compile("|".join(sorted(non_exclusion_terms)), re.IGNORECASE)
-        else:
-            self.non_excluded_pat = None
-
-        message("Search Terms:", self.terms)
-        message("Search Terms Pattern:", self.terms_pattern)
-        message("Search Terms Without Exclusions:", non_exclusion_terms)
-        message("Exclusions Patterns:", self.exclusion_patterns)
-
-    def _read_blocked_db(self, file_path):
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                elif ' :! ' in line:
-                    term, exclusions = line.split(" :! ", 1)
-                    term = term.strip()
-                    exclusions = set(exclusion.strip() for exclusion in exclusions.strip().split(',') if exclusion.strip())
-                else:
-                    term = line
-                    exclusions = set()
-
-                yield term, exclusions
-
-
-    def should_block(self, line):
-        # -- If there are no exclusion patterns, then the egrep command found a blockable match
-        if not self.exclusion_patterns:
-            return True
-
-        # -- If there are exclusion patterns, check if any of the patterns without exclusions
-        # match this line - if any do, this is also a blockable match
-        if self.non_excluded_pat and self.non_excluded_pat.search(line):
-            return True
-
-        for check_pat, exclusions_pat in self.exclusion_patterns:
-            found = [m.group(1) for m in check_pat.finditer(line)]
-            if found:
-                # -- Line term found
-                excluded = [m.group(1) for m in exclusions_pat.finditer(line)]
-                if found != excluded:
-                    # -- All matches are NOT also exclusions, so this is a 'should block' line
-                    return True
-        return False
-
 
 class AllowedDB:
     def __init__(self, db_file_name):
         self.db_file_name = db_file_name
         self.db = defaultdict(lambda : defaultdict(set))
         if os.path.exists(db_file_name):
-            message("Reading allowed db {}".format(db_file_name))
+            logging.info(f"Reading allowed db {db_file_name}")
             with open(db_file_name) as f:
                 try:
                     line = None
@@ -123,16 +34,16 @@ class AllowedDB:
                         if line:
                             self.add_line_to_db(line)
                 except Exception as e:
-                    message(e)
-                    message(repr(line))
+                    logging.error(e)
+                    logging.error(repr(line))
                     raise
         else:
-            message("Allowed db file {} not found".format(db_file_name))
+            logging.error(f"Allowed db file {db_file_name} not found")
 
         num_lines = len(self.db)
         files = set(file_path for file_paths in self.db.values() for file_path in file_paths)
         num_files = len(files)
-        message("Found {} allowed lines across {} files".format(num_lines, num_files))
+        logging.info(f"Found {num_lines} allowed lines across {num_files} files")
 
     def add_line_to_db(self, line):
         file_path, line_no, line_text = self._split_line(line)
@@ -149,6 +60,7 @@ class AllowedDB:
 def get_cmd_output(cmd):
     try:
         start = time.time()
+        logging.debug(f"COMMAND: {cmd}")
         result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
 
         n_lines = n_errors = 0
@@ -162,85 +74,74 @@ def get_cmd_output(cmd):
                 line = line.strip()
                 if line:
                     n_errors += 1
-                    #message(line[:150])
+                    logging.debug(line[:150])
         elapsed = time.time() - start
         if elapsed > 5.0:
-            message("LONG RUNNING:", "{:4.2f} seconds".format(elapsed), cmd)
+            logging.debug("LONG RUNNING:", f"{elapsed:4.2f} seconds", cmd)
     except subprocess.TimeoutExpired as e:
-        message("TIMEOUT EXPIRED:", str(e), cmd)
+        logging.debug("TIMEOUT EXPIRED:", str(e), cmd)
         return
     except BaseException as e:
-        message("ERROR:", str(e), cmd)
+        logging.error(f"ERROR: {e}, {cmd}")
         raise
 
 
-blocked_db = None
-
-def check_path(path):
-    # -- blocked_db is a global so that it's set up once before the worker nodes starts
-    global blocked_db
-
+def check_path(terms_pattern, no_term_allowed, exclusion_patterns, non_excluded_pattern, path):
     # -- Use array rather than yield because this data gets passed via multiprocessing mechanisms
     found_lines = []
     line_skip_pat = '^egrep: |^Binary file |term-allowed|"image/png":'
-    if IGNORE_TERM_ALLOWED:
+    if no_term_allowed:
         line_skip_pat = line_skip_pat.replace("term-allowed|", '', 1)
     dir_suffix = "/*" if os.path.isdir(path) else ""
-    cmd = "egrep -iHn '{}' '{}'{} | egrep -v '{}'".format(blocked_db.terms_pattern, path, dir_suffix, line_skip_pat)
+    cmd = f"egrep -iHn '{terms_pattern}' '{path}'{dir_suffix} | egrep -v '{line_skip_pat}'"
     for line in get_cmd_output(cmd):
         if not line:
             continue
         if len(line) > 1000:
-            message("LINE TOO LONG:",len(line), line[:100])
+            logging.warning(f"LINE TOO LONG: {len(line)} {line[:100]}")
             continue
 
-        if blocked_db.should_block(line):
+        if should_block(line, exclusion_patterns, non_excluded_pattern):
+            logging.debug(f"BLOCKED: {line[:100]}")
             found_lines.append(line)
         else:
-            pass # message("NOT BLOCKED:", line[:100])
+            logging.debug(f"NOT BLOCKED: {line[:100]}")
     return found_lines
 
 
-def find_term_lines(paths):
-    import multiprocessing
-    import time
+def find_term_lines(paths, terms_pattern, no_term_allowed, exclusion_patterns, non_excluded_pattern):
+    with multiprocessing.Pool(None) as pool:
+        check_path_partial = functools.partial(check_path, terms_pattern, no_term_allowed, exclusion_patterns, non_excluded_pattern)
+        for found_lines in pool.imap_unordered(check_path_partial, paths, chunksize=1):
+            yield None
+            yield from found_lines
 
-    start_time = time.time()
-    next_time = start_time + 1.0
-    n_complete_since_last = 0
-    tot_complete = 0
-    tot_lines = 0
+def find_term_lines_with_progress(paths, terms_pattern, no_term_allowed, exclusion_patterns, non_excluded_pattern):
+    progress = ProgressTracker("paths", "lines")
+    for line in find_term_lines(paths, terms_pattern, no_term_allowed, exclusion_patterns, non_excluded_pattern):
+        if line == None:
+            progress.increment("paths")
+        else:
+            progress.increment("lines")
+            yield line
+        progress.message()
+    progress.end()
 
-    def _progress_message(force=False):
-        nonlocal next_time, n_complete_since_last, tot_lines
-        if (force and n_complete_since_last) or time.time() >= next_time:
-            secs = time.time()-start_time
-            ave = tot_complete / secs
-            message("Secs: {secs:6.1f},  Completed Since: {n_complete_since_last:3},  Total Completed: {tot_complete:5},  Ave Completed/Second: {ave:5.2f},  Total lines found: {tot_lines:6}".format(**locals()))
-            next_time = time.time() + 1.0
-            n_complete_since_last = 0
+def check_terms(file_paths, ignore_allowed_db, no_term_allowed, verbose=False):
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format='%(process)5d  %(relativeCreated)7d  %(levelname)6s: %(message)s',
+    )
+    install_mp_handler()
+    terms_pattern, exclusion_patterns, non_excluded_pattern = load_blocked_db(".check_terms.cfg")
+    line_skip_pat = '^egrep: |^Binary file |term-allowed|"image/png":'
+    if no_term_allowed:
+        line_skip_pat = line_skip_pat.replace("term-allowed|", '', 1)
 
-    with multiprocessing.Pool(4) as pool:
-
-        for found_lines in pool.imap_unordered(check_path, paths, chunksize=1):
-            tot_complete += 1
-            n_complete_since_last += 1
-            for line in found_lines:
-                tot_lines += 1
-                yield line
-            _progress_message()
-
-        _progress_message(force=True)
-
-
-def check_terms(file_paths):
-    global blocked_db
-
-    blocked_db = BlockedDB(".check_terms.cfg")
     allowed_db = AllowedDB(".check_terms-allowed.txt")
     num_found = 0
-    for line in find_term_lines(file_paths):
-        if IGNORE_ALLOWED_DB or not allowed_db.find_line_in_db(line):
+    for line in find_term_lines_with_progress(file_paths, terms_pattern, no_term_allowed, exclusion_patterns, non_excluded_pattern):
+        if ignore_allowed_db or not allowed_db.find_line_in_db(line):
             print("PROBLEM:", line)
             num_found += 1
     return num_found
